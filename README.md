@@ -1,2 +1,2 @@
 # BeU2-Net
-coming soon...
+The code for BeU2-Net and the dataset will be released here
