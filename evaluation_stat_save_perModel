@@ -1,0 +1,204 @@
+from utils import *
+import torch
+from datasets.dataset import A4C_train_datasets, A4C_val_datasets,A4C_test_datasets
+from configs.config_setting import setting_config
+from torch.utils.data import DataLoader
+from models.u2net_var1 import u2net_lite
+from tqdm import tqdm
+from hausdorff import hausdorff_distance
+import pandas as pd
+import csv
+from sklearn.metrics import classification_report
+from medpy import metric
+
+
+
+def main(config):
+    # difine the maximum distance if the predicted class is missing
+    image_shape = (config.input_size_h, config.input_size_w)
+    pixel_spacing = (1, 1)
+    max_distance = max_distance = np.sqrt((image_shape[0] * pixel_spacing[0])**2 + (image_shape[1] * pixel_spacing[1])**2)
+    # print(f"Maximum distance: {max_distance} mm")
+    
+    gpu_id = '0'
+    save_root = 'statistic_analysis/'
+    test_model_dir = 'results_important/BeU2_En1_3_DiceLoss_V9T10_9007/checkpoints/best-epoch120-loss0.6891.pth'
+    model_name = test_model_dir.split('/')[-3]
+    os.environ["CUDA_VISIBLE_DEVICES"] = gpu_id
+    torch.cuda.empty_cache()
+
+    test_dataset = A4C_test_datasets(config.data_path, config, train=False,test=True)
+    test_loader = DataLoader(test_dataset,
+                                    batch_size=1,
+                                    shuffle=False,
+                                    pin_memory=True, 
+                                    num_workers=config.num_workers,
+                                    drop_last=True)
+    print('#----------Testing----------#')
+    model = u2net_lite(out_ch=config.num_classes)
+    model = model.cuda()
+    best_weight = torch.load(test_model_dir, map_location=torch.device('cpu'))
+    model.load_state_dict(best_weight)
+    
+    model.eval()
+
+    
+    F1_list = [] #5个分类的平均值
+    # F1_back = [] #0
+    F1_LV_list = [] #1
+    F1_RV_list = [] #2
+    F1_RA_list = [] #3
+    F1_LA_list = [] #4
+    # F1_mean_no_back = []
+     
+    dH_list = [] #4个分类的平均值
+    dH_LV_list = []
+    dH_RV_list = []
+    dH_RA_list = []
+    dH_LA_list = []
+    
+    asd_list = []
+    asd_LV_list = []
+    asd_RV_list = []
+    asd_RA_list = []
+    asd_LA_list = []
+    
+    names = []
+    mIoU = 0
+    PA = 0
+    
+    
+    with torch.no_grad():
+        for i, data in enumerate(tqdm(test_loader)):
+            img, msk,edges,fname = data
+            img, msk = img.cuda(non_blocking=True).float(), msk.cuda(non_blocking=True).float()
+            
+            # 在cuda上计算的部分
+            out = model(img)
+            # 总体计算F
+            # _f_score = f_score(out[0],msk).cpu().detach().numpy()
+            # F1_list.append(_f_score)
+           
+            msk = msk.squeeze(1).cpu().detach().numpy()
+            pred = out[0]
+            # pred = torch.softmax(pred)
+            # pred = pred.argmax(1)#1,5,256,256 jia softmax tensor
+            # gts.append(msk)
+            pred = pred.squeeze(1).cpu().detach().numpy() #1,5,256,256 nd.array
+            
+            assert msk.shape == pred.shape
+            names.append(str(fname[0]))
+            
+            msk = np.where(np.squeeze(msk, axis=0) > 0.5, 1, 0) #5,256,256
+            msk1 = msk[1,:,:]
+            msk2 = msk[2,:,:]
+            msk3 = msk[3,:,:]
+            msk4 = msk[4,:,:]
+            msk = msk.argmax(axis=0)#256,256
+            
+            pred = np.where(np.squeeze(pred, axis=0) > config.threshold, 1, 0)#5,256,256
+            pred1 = pred[1,:,:]
+            pred2 = pred[2,:,:]
+            pred3 = pred[3,:,:]
+            pred4 = pred[4,:,:]
+            pred = pred.argmax(axis=0)#256,256
+            
+             #计算单类F1 score
+            f1_LV = metric.binary.dc(pred1, msk1)
+            f1_RV = metric.binary.dc(pred2, msk2)
+            f1_RA = metric.binary.dc(pred3, msk3)
+            f1_LA = metric.binary.dc(pred4, msk4)
+            
+            F1_LV_list.append(f1_LV)
+            F1_RV_list.append(f1_RV)
+            F1_RA_list.append(f1_RA)
+            F1_LA_list.append(f1_LA)
+            f1_mean = (f1_LV+f1_RV+f1_RA+f1_LA)/4
+            F1_list.append(f1_mean) #F1 score without background
+            
+            
+            # 计算HD
+            # hds_1 = hausdorff_distance(pred_hds1, msk_hds1, distance="manhattan")
+            if np.sum(pred1)==0:
+                hds1 = max_distance
+                asd_LV = max_distance
+            else: 
+                hds1 = metric.binary.hd(pred1, msk1)
+                asd_LV = metric.binary.asd(pred1, msk1)
+              
+            if np.sum(pred2)==0:
+                hds2 = max_distance
+                asd_RV = max_distance
+            else:   
+                hds2 = metric.binary.hd(pred2, msk2) 
+                asd_RV = metric.binary.asd(pred2, msk2)
+            
+            if np.sum(pred3)==0:
+                hds3 = max_distance
+                asd_RA = max_distance
+            else: 
+                hds3 = metric.binary.hd(pred3, msk3) 
+                asd_RA = metric.binary.asd(pred3, msk3)
+                
+            if np.sum(pred4)==0:
+                hds4 = max_distance
+                asd_LA = max_distance
+            else: 
+                hds4 = metric.binary.hd(pred4, msk4) 
+                asd_LA = metric.binary.asd(pred4, msk4)
+            
+            dH_mean = (hds1+hds2+hds3+hds4)/4
+            dH_LV_list.append(hds1) 
+            dH_RV_list.append(hds2)
+            dH_RA_list.append(hds3)
+            dH_LA_list.append(hds4)
+            dH_list.append(dH_mean)
+                       
+            asd_LV_list.append(asd_LV)
+            asd_RV_list.append(asd_RV)
+            asd_RA_list.append(asd_RA)
+            asd_LA_list.append(asd_LA)
+            asd_mean = (asd_LV + asd_RV + asd_RA+ asd_LA)/4
+            asd_list.append(asd_mean)
+            
+            
+        test_evaluation = pd.DataFrame()
+        test_evaluation['Name'] = names
+        # test_evaluation['mIoU'] = mIoU_list
+        test_evaluation['F1_mean_no_back'] = F1_list
+        test_evaluation['F1_LV'] = F1_LV_list
+        test_evaluation['F1_RV'] = F1_RV_list
+        test_evaluation['F1_RA'] = F1_RA_list
+        test_evaluation['F1_LA'] = F1_LA_list
+        
+        test_evaluation['dH_LV'] = dH_LV_list
+        test_evaluation['dH_RV'] = dH_RV_list
+        test_evaluation['dH_RA'] = dH_RA_list
+        test_evaluation['dH_LA'] = dH_LA_list
+        test_evaluation['dH_mean'] = dH_list
+        
+        test_evaluation['asd_LV'] = asd_LV_list
+        test_evaluation['asd_RV'] = asd_RV_list
+        test_evaluation['asd_RA'] = asd_RA_list
+        test_evaluation['asd_LA'] = asd_LA_list
+        test_evaluation['asd_Mean'] = asd_list
+        # test_evaluation['Background'] = iu_class0_list
+        
+        # model_name = test_model_dir.split('/')[-3]
+        if os.path.exists(save_root + '//stat.csv'):
+            test_evaluation.to_csv(save_root + '//stat.csv',mode='a', index = True, header = False)
+            # with open (save_root + '//stat.csv',mode='a', newline='', encoding='utf8') as f:
+            #     csv_writer = csv.writer(f)
+            #     newline = ""
+            #     # csv_writer.writerow(newline)
+            #     name = ['Name','IoU_LV','IoU_RV','IoU_RA','IoU_LA','IoU_Mean','dH_LV','dH_RV','dH_RA','dH_LA','dH_mean']
+            #     z = [iou_LV_list,iou_RV_list,iou_RA_list,iou_LA_list,mIoU_list,dH_LV_list,dH_RV_list,dH_RA_list,dH_LA_list,dH_list]
+            #     csv_writer.writerow(z)
+            #     f.close()       
+        else:
+            test_evaluation.to_csv(save_root + '//stat.csv')
+            print('evaluation saved!')
+        
+if __name__ == '__main__':
+    config = setting_config
+    main(config)
